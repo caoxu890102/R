@@ -1,0 +1,707 @@
+---
+title: "Sales Excellence - Logistic Regression vs GBM"
+author: "Cindy Cao"
+date: "5/7/2018"
+output: html_document
+code_folding: hide
+---
+
+```{r, echo=FALSE, include=FALSE}
+#Load libraries
+library(data.table)
+library(dplyr)
+library(weights)
+library(ggvis)
+library(ggplot2)
+library(haven)
+library(caret)
+library(gbm)
+library(utils)
+library(Hmisc)
+library(woeBinning)
+library(lubridate)
+library(gridExtra)
+library(grid)
+library(knitr)
+library(kableExtra)
+library(corrplot)
+library(caret)
+library(car)
+library(gsubfn)
+library(partykit)
+library(rattle)
+library(rpart)
+library(rpart.plot)
+library(RColorBrewer)
+library(pROC)
+library(ROCR)
+library(DMwR)
+library(ROSE)
+library(partykit)
+library(nnet)
+```
+
+### Outline:
+1. Problem statement
+2. Feature engineering
+3. Variable reduction
+4. Logistic regression
+5. Smote GBM
+6. Model Comparison
+
+### 1.Problem Statement
+A digital arm of a bank faces challenges with lead conversions. The primary objective of this division is to increase customer acquisition through digital channels. The division was set up a few years back and the primary focus of the division over these years has been to increase the number of leads getting into the conversion funnel.
+
+They source leads through various channels like search, display, email campaigns and via affiliate partners. As expected, they see differential conversion depending on the sources and the quality of these leads.
+
+They now want to identify the leads' segments having a higher conversion ratio (lead to buying a product) so that they can specifically target these potential customers through additional channels and re-marketing. They have provided a partial data set for salaried customers from the last 3 months. They also capture basic details about customers. We need to identify the customers with a high probability of conversion.
+
+This project used logistic regression and smote GBM models to help the bank better identify the high conversion leads, and reduce cost.
+
+```{r include=FALSE, warning=FALSE,message=FALSE}
+#Set up path and load functions
+dataloc<-"C:/Users/caoxu001/Desktop/Personal/R_Project/sales.excellence/Data/"
+funcs<-"C:/Users/caoxu001/Desktop/Personal/R_Project/sales.excellence/Functions/"
+output<-"C:/Users/caoxu001/Desktop/Personal/R_Project/sales.excellence/Output/"
+source(paste0(funcs,"functions.r"))
+source(paste0(funcs,"WOE_numeric_split-copy.R"))
+source(paste0(funcs,"Data_Diagnostics.R"))
+source(paste0(funcs,"attr.bivar.R"))
+source(paste0(funcs,"smbinning.R"))
+source(paste0(funcs,"KS_summary.R"))
+```
+
+####Attributes summary
+```{r, echo=FALSE, warning=FALSE}
+var<-fread(paste0(dataloc,'variables.csv'),header=TRUE)
+kable(var,'html')%>%kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+####Examine target
+```{r, echo=FALSE, warning=FALSE}
+data<-fread(paste0(dataloc,'train.csv'),header=TRUE)
+data$Approved_level<-as.factor(ifelse(data$Approved==1,'Approved','Rejected'))
+summary(data$Approved_level)
+print(paste("The approval ratio in our dataset is",1020/(1020+68693)))
+```
+
+From the Approval ratio, we notice that the target is imbalanced.
+For target that does not have an obvious distribution, we need to do simulation and examine the distribution of the target.
+```{r, echo=FALSE}
+# plot(ecdf(train$target),main='ecdf of Monthly_Income_log_capped')
+```
+
+####Split Train/Test/Holdout: 50%/25%/25%
+```{r cars, include=FALSE, warning=FALSE}
+set.seed(1)
+inDTSet = createDataPartition(data$Approved,p=.5, list = FALSE)
+dt = data[inDTSet,]
+dt2= data[-inDTSet,]
+inTrainingSet = createDataPartition(dt$Approved,p=.75, list = FALSE)
+trainset = dt[inTrainingSet,]  #for model training
+cutoffset= dt[-inTrainingSet,] #for optimize cutoff value
+
+set.seed(123)
+inTestSet = createDataPartition(dt$Approved,p=.5, list = FALSE)
+testset = dt2[inTestSet,]      #for test model performance
+holdout = dt2[-inTestSet,]     
+
+train<-trainset
+```
+
+```{r}
+##trainset number of records:
+nrow(trainset)
+summary(trainset$Approved_level)
+##testset number of records:
+nrow(testset)
+summary(testset$Approved_level)
+##holdoutset number of records:
+nrow(holdout)
+summary(holdout$Approved_level)
+```
+
+### 2.Feature Engineering
+```{r, echo=FALSE, warning=FALSE}
+summarise_dataset(train,outfile=paste0(output,"data_diagnostics.csv"))
+diagnostic<-fread(paste0(output,"AppendixA.data_diagnostics.csv"),header=TRUE)
+options(knitr.kable.NA = '')
+kable(diagnostic,'html')%>%kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+Loan_Amount, Loan_Period, Interest_Rate, and EMI have very high missing rate, so let's look at these four variables first. 
+
+I used histogram, boxplot, bivariate chart and WOE binning for attribute analysis and transformation 
+
+WOE=ln($\frac{p(non-event)}{p(event)}$)
+
+IV=$\sum_{i=1}^n (DistributionGood-DistributionBad)$*WOE
+
+Loan Amount
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+summary(train$Loan_Amount)
+
+#Check histogram and boxplot of the original variable
+p<-ggplot(data=train, aes(train$Loan_Amount)) + geom_histogram()+ xlab('Histogram')+ylab('Loan amount')
+p2<-ggplot(data=train,aes(x=1,y=train$Loan_Amount))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Loan Amount")
+
+#Check histogram and boxplot of the log transformed variable
+p<-train%>%ggplot(aes(log(train$Loan_Amount))) + geom_histogram()+ xlab('Histogram')+ylab('Log of Loan amount')
+p2<-train%>%ggplot(aes(x=1,y=log(train$Loan_Amount)))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Log of Loan Amount")
+
+bivar.plot(train,'Loan_Amount','Approved')
+bivar.plot(train,'Loan_Amount','Approved',missing='zero')
+smbinning(train,'Approved','Loan_Amount')
+```
+
+```{r warning=FALSE, message=FALSE}
+#Create missing flag
+train$Loan_Amount_flag<-as.factor(ifelse(is.na(train$Loan_Amount),1,0))
+#Impute missing values
+train$Loan_Amount_Impute_F<-coalesce(as.numeric(train$Loan_Amount),-1)
+#Create binned variable
+train$M_Loan_Amount_F<-as.factor(ifelse(train$Loan_Amount_Impute_F<50000&train$Loan_Amount_Impute_F>0,0,ifelse(train$Loan_Amount_Impute_F>0,1,-1)))
+#Check target performance for each bin
+train%>%group_by(M_Loan_Amount_F)%>%summarise(approval=sum(Approved),cnt=n(),ratio=approval/cnt)
+```
+
+Loan_Period
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#Check histogram of the variable
+ggplot(data=train, aes(train$Loan_Period)) + geom_histogram()+ xlab('Histogram')+ylab('Loan_Period')
+```
+
+```{r warning=FALSE, message=FALSE}
+#Create missing flag
+train$Loan_Period_flag<-as.factor(ifelse(is.na(train$Loan_Period),1,0))
+#Impute missing values
+train$Loan_Period_Impute<-(coalesce(as.numeric(train$Loan_Period),-1))
+#Create factor variable
+train$M_Loan_Period_F<-as.factor(train$Loan_Period_Impute)
+#Check target performance for each bin
+train%>%group_by(Loan_Period_flag)%>%summarise(approval=sum(Approved),cnt=n(),ratio=approval/cnt)
+```
+
+Interest Rate
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+summary(train$Interest_Rate)
+#Check histogram and boxplot of the original variable
+p<-ggplot(data=train, aes(train$Interest_Rate)) + geom_histogram()+ xlab('Histogram')+ylab('Interest_Rate')
+p2<-ggplot(data=train,aes(x=1,y=train$Interest_Rate))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Interest_Rate")
+
+bivar.plot(train,'Interest_Rate','Approved')
+```
+
+```{r warning=FALSE, message=FALSE}
+#Create missing glag
+train$Interest_Rate_flag<-as.factor(ifelse(is.na(train$Interest_Rate),1,0))
+#Impute missing values
+mean((train[!is.na(train$Interest_Rate),]$Interest_Rate))
+quantile(train[!is.na(train$Interest_Rate),]$Interest_Rate,0.95)
+train$Interest_Rate_Impute<-coalesce(as.numeric(train$Interest_Rate),19.23383)
+bivar.plot(train,'Interest_Rate_Impute','Approved',n.rank=50)
+```
+
+EMI (Equated Monthly Installment)
+
+EMI=$\frac{r*Lan_Amount}{1-(1+r)^(-n)}$
+
+EMI is highly correlated with Interest Rate and Loan Amount
+consider regression imputation
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+summary(train$EMI)
+#Check histogram and boxplot of the original variable
+p<-ggplot(data=train, aes(train$EMI)) + geom_histogram()+ xlab('Histogram')+ylab('EMI')
+p2<-ggplot(data=train,aes(x=1,y=train$EMI))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="EMI")
+#Check histogram and boxplot of the log transformed variable
+train$EMI_log<-log(train$EMI)
+p<-ggplot(data=train, aes(train$EMI_log)) + geom_histogram()+ xlab('Histogram')+ylab('EMI_log')
+p2<-ggplot(data=train,aes(x=1,y=train$EMI_log))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="EMI_log")
+
+#Impute missing values
+quantile(train[!is.na(train$EMI_log),]$EMI_log,0.99)
+quantile(train[!is.na(train$EMI_log),]$EMI_log,0.01)
+#Cap outliers
+train$EMI_log_capped<-pmin(pmax(train$EMI_log,5.476464),8.3113)
+```
+
+```{r warning=FALSE, message=FALSE}
+train$EMI_flag<-as.factor(ifelse(is.na(train$EMI),1,0))
+bivar.plot(train,'EMI_log_capped','Approved')
+train$M_EMI<-coalesce(as.numeric(train$EMI_log_capped),0)
+bivar.plot(train,'M_EMI','Approved')
+train$M_EMI<-ifelse(train$M_EMI<6,1,
+                                 ifelse(train$M_EMI<7.5,2,3))
+train%>%group_by(M_EMI)%>%summarise(approval=sum(Approved),cnt=n(),ratio=approval/cnt)
+```
+
+For high missing rate attributes, I lean towards excluding them from regression model. However, I will keep them as potential candidates and compare models with or without these high missing rate variables.
+
+####Categorical variable analysis
+Convert categorical variables to factors
+```{r message=FALSE, warning=FALSE}
+train$M_City_Category_F<-as.factor(train$City_Category)
+train$M_Employer_Category1_F<-as.factor(train$Employer_Category1)
+train$M_Employer_Category2_F<-as.factor(train$Employer_Category2)
+train$M_Primary_Bank_Type_F<-as.factor(train$Primary_Bank_Type)
+train$M_Contacted_F<-as.factor(train$Contacted)
+train$M_Gender_F<-as.factor(train$Gender)
+train$M_Source_Category_F<-as.factor(train$Source_Category)
+train$M_Var1_F<-as.factor(train$Var1)
+train%>%group_by(M_Var1_F)%>%summarise(approval=sum(Approved),cnt=n(),ratio=approval/cnt)
+```
+
+####Numeric variable analysis
+Correlation
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#Plot correlations between numerical variables
+indata <- as.data.frame(trainset)
+  
+  colclasses <- sapply(indata,class)
+  
+  logicalColumns <- which(colclasses=="logical")
+  charColumns <- which(colclasses=="character")
+  factorColumns <- which(colclasses=="factor")
+  intColumns <- c(which(colclasses=="integer"), which(colclasses=="integer64"))
+  floatColumns <- which(colclasses=="numeric")
+  dateColumns <- which(colclasses=="Date")
+  
+numeric_mydata<-cbind(indata[,floatColumns],indata[,intColumns]) 
+train_impute<-impute(numeric_mydata,fun=median)
+str(numeric_mydata)
+
+M <- cor(train_impute)
+corrplot(M, method="circle")
+
+#Check how many correlations are higher than 0.5
+k = 0
+for(i in 1:nrow(M)){
+for(r in 1:ncol(M)){
+  if(M[i,r]> 0.50 & i != r){
+    k= k + 1
+  }
+}  }
+print(paste("There are",k/2,"pairs of correlations are higher than 0.5"))
+```
+
+Monthly Income
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+summary(train$Monthly_Income)
+#Check histogram and boxplot of the original variable
+p<-ggplot(data=train, aes(train$Monthly_Income)) + geom_histogram()+ xlab('Histogram')+ylab('Monthly_Income')
+p2<-ggplot(data=train,aes(x=1,y=train$Monthly_Income))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Monthly_Income")
+
+#Check histogram and boxplot of the log transformed variable
+train$Monthly_Income_log<-log(train$Monthly_Income+1)
+p<-ggplot(data=train, aes(train$Monthly_Income_log)) + geom_histogram()+ xlab('Histogram')+ylab('Monthly_Income_log')
+p2<-ggplot(data=train,aes(x=1,y=train$Monthly_Income_log))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Monthly_Income_log")
+
+#Impute missing values
+quantile(train[!is.na(train$Monthly_Income_log),]$Monthly_Income_log,0.995)
+quantile(train[!is.na(train$Monthly_Income_log),]$Monthly_Income_log,0.05)
+#Use quantile and minimal wage to determine cap values
+train$Monthly_Income_log_capped<-pmin(pmax(train$Monthly_Income_log,6.908755),10.59666 )
+
+#Check histogram and boxplot of the capped variable
+p<-ggplot(data=train, aes(train$Monthly_Income_log_capped)) + geom_histogram()+ xlab('Histogram')+ylab('Monthly_Income_log_capped')
+p2<-ggplot(data=train,aes(x=1,y=train$Monthly_Income_log_capped))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Monthly_Income_log_capped")
+```
+```{r warning=FALSE, message=FALSE}
+train$Monthly_Income_log_capped<-pmin(pmax(train$Monthly_Income_log,6.908755),10.59666 )
+bivar.plot(train,'Monthly_Income_log_capped','Approved')
+
+#Use WOE to create binned variable
+WOE_numeric_split(x='Monthly_Income_log_capped',y1='Approved',y0='one',data=train,group=20)
+#Create a continuous variable for each group based on WOE cutoff values
+train$Monthly_Income_grp1<-pmin(pmax(train$Monthly_Income_log_capped,7.630655),9)-7.630655
+train$Monthly_Income_grp2<-pmax(7.630655-train$Monthly_Income_log_capped,0)
+train$Monthly_Income_grp3<-pmin(train$Monthly_Income_log_capped-9,0)
+bivar.plot(train,'Monthly_Income_grp1','Approved',n.rank=50,type='line')
+```
+
+Existing EMI
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+summary(train$Existing_EMI)
+#Check histogram and boxplot of the original variable
+p<-ggplot(data=train, aes(train$Existing_EMI)) + geom_histogram()+ xlab('Histogram')+ylab('Existing_EMI')
+p2<-ggplot(data=train,aes(x=1,y=train$Existing_EMI))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Existing_EMI")
+
+train$Existing_EMI_Impute<-coalesce(train$Existing_EMI,0)
+train$Existing_EMI_log<-log(train$Existing_EMI_Impute+1)
+#Check histogram and boxplot of the log transformed variable
+p<-ggplot(data=train, aes(train$Existing_EMI_log)) + geom_histogram()+ xlab('Histogram')+ylab('Existing_EMI_log')
+p2<-ggplot(data=train,aes(x=1,y=train$Existing_EMI_log))+geom_boxplot()+xlab('Boxplot')+ylab('')
+grid.arrange(p,p2, ncol=2, top="Existing_EMI_log")
+
+quantile(train[!is.na(train$Existing_EMI_log),]$Existing_EMI_log,0.99)
+quantile(train[!is.na(train$Existing_EMI_log),]$Existing_EMI_log,0.01)
+bivar.plot(train,'Existing_EMI','Approved',n.rank=100)
+#Cap the variable based on bivariate plot
+train$Existing_EMI_log_capped<-pmin(pmax(train$Existing_EMI_log,0),8.305953)
+```
+```{r warning=FALSE, message=FALSE}
+#Create missing flag
+train$Existing_EMI_flag<-as.factor(ifelse(is.na(train$Existing_EMI),1,0))
+bivar.plot(train,'Existing_EMI_log_capped','Approved')
+#Use WOE to create binned variable
+WOE_numeric_split(x='Existing_EMI_log_capped',y1='Approved',y0='one',data=train,group=10)
+train$M_Existing_EMI<-ifelse(train$Existing_EMI_log_capped<6.215408,-0.3386977,
+                             ifelse(train$Existing_EMI_log_capped<6.907455,0.1656408,1.0226385))
+train%>%group_by(M_Existing_EMI)%>%summarise(approval=sum(Approved),cnt=n(),ratio=approval/cnt)
+```
+
+####Date variables: DOB and Lead_Date
+```{r warning=FALSE, message=FALSE}
+train$DOB<- as.Date(train$DOB,
+                   format = "%d/%m/%y")
+train$Lead_Creation_Date<- as.Date(train$Lead_Creation_Date,
+                                  format = "%d/%m/%y")
+train$M_DOB_Year<-year(train$DOB)
+train$M_DOB_Year<-pmin(coalesce(train$M_DOB_Year,2016),2016-21)
+train$M_DOB_Month<-month(train$DOB)
+train$M_Lead_Year<-pmin(year(train$Lead_Creation_Date),2016)
+train$M_Lead_Month<-month(train$Lead_Creation_Date)
+
+train$M_Lead_Month<-as.factor(train$M_Lead_Month)
+train$M_DOB_Month<-as.factor(train$M_DOB_Month)
+```
+
+### 3.Variable Reduction
+####KS summary
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#Calculate KS between dependent variable and each independent variable and create a csv file
+KSselection(indata,outfile=output,target="Approved")
+```
+
+####Decision tree
+Decision tree cannot split trees on imbalanced data
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+fm<-as.formula(Approved ~ Gender+City_Category
+             +Employer_Category1+Employer_Category2
+             +Monthly_Income
+             +Primary_Bank_Type+Contacted+Source_Category
+             +Existing_EMI+Var1
+             +Loan_Amount_flag
+             +Interest_Rate
+             +EMI
+             +Loan_Amount
+             +Loan_Period
+             )
+dt_fit <- rpart(fm,
+             data=train,
+             method="class")
+rpart.plot(dt_fit)
+summary(dt_fit)
+```
+
+####Decision tree with rose-upsampling data
+```{r, warning=FALSE, message=FALSE}
+fm<-as.formula(Approved ~ M_Gender_F+M_City_Category_F
+             +M_Employer_Category1_F+M_Employer_Category2_F
+             +M_Monthly_Income
+             +M_Primary_Bank_Type_F+M_Contacted_F+M_Source_Category_F
+             +M_Existing_EMI+Var1
+             +Interest_Rate
+             +EMI
+             +Loan_Amount
+             +Loan_Period
+             )
+data.rose <- ROSE(fm, data = train, seed = 1)$data
+
+dt_rose_fit <- rpart(fm,
+               data=data.rose,
+               method="class")
+rpart.plot(dt_rose_fit)
+summary(dt_rose_fit)
+```
+
+### 4.Logistic Regression
+Create Dummy variables
+```{r, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+colclasses <- sapply(train,class)
+factorColumns <- which(colclasses=="factor")
+train.other<-train%>%select(-factorColumns)
+train.dummy<-train%>%select(factorColumns)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE,results='hide'}
+model.matrix(~M_City_Category_F+ M_Employer_Category1_F+
+              M_Employer_Category2_F+M_Primary_Bank_Type_F+
+              M_Source_Category_F+Interest_Rate_flag+
+              M_Var1_F+M_Loan_Period_F+M_Loan_Amount_F, train.dummy)
+```
+```{r,echo=FALSE}
+train.model <- (dummyVars(~ M_City_Category_F+ M_Employer_Category1_F+
+              M_Employer_Category2_F+M_Primary_Bank_Type_F+
+              M_Source_Category_F+Interest_Rate_flag+M_Var1_F+M_Loan_Period_F
+              +M_Loan_Amount_F
+              , data = train.dummy))
+train2<-as.data.frame(predict(train.model, train.dummy[1:nrow(train.model),]))
+
+train3<-cbind(train2,train.other)
+train3<-train3%>%mutate(M_Gender_F=train$M_Gender_F,M_Contacted_F=train$M_Contacted_F)
+```
+
+- Backward selection
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+fm<-as.formula(Approved~M_Gender_F
++M_City_Category_F.B
++M_Employer_Category1_F.A               
++M_Primary_Bank_Type_F.
++M_Primary_Bank_Type_F.G
++Existing_EMI_log_capped
++Interest_Rate_flag.1
++Monthly_Income_grp1
++Monthly_Income_grp2
++M_Var1_F.10
+)
+
+lr.model<-glm(fm, data=train3,
+               family = binomial(link = "logit"))
+summary(lr.model)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#load transformed test dataset, all tranformations are consistent with training dataset
+load(paste0(dataloc,"test3.RData"))
+#Calculate model prediction with test dataset
+test3$pred<-round(predict(lr.model,newdata=test3,type='response'))
+confusionMatrix(test3$pred,test3$Approved)
+```
+
+```{r,echo=FALSE}
+train4<-train3%>%dplyr::select(Approved,M_Gender_F
+,M_City_Category_F.B
+,M_Employer_Category1_F.A               
+,M_Primary_Bank_Type_F.
+,M_Primary_Bank_Type_F.G
+,Existing_EMI_log_capped
+,Interest_Rate_flag.1
+,Monthly_Income_grp1
+,Monthly_Income_grp1
+,M_Var1_F.10)
+```
+
+####Look for interaction term with forward selection
+Stepwise forward selection to get interaction terms
+```{r, echo=FALSE}
+null<-glm(Approved~1, data=train4,
+               family = binomial(link = "logit"))
+full<-glm(Approved~.+.^2,data=train4,
+          family = binomial(link = "logit"))
+fwd<-step(null,scope=formula(full),
+          direction='forward',k=2)
+summary(fwd)
+save(fwd,file=paste0(output,"stepwise_fwd.RData"))
+
+fm_fwd<-as.formula(Approved ~ M_Primary_Bank_Type_F. + M_Primary_Bank_Type_F.G + 
+    Existing_EMI_log_capped + M_Employer_Category1_F.A + 
+    M_Gender_F + M_City_Category_F.B + M_Var1_F.10 +Interest_Rate_flag.1 +Monthly_Income_grp1  +Monthly_Income_grp2+M_Primary_Bank_Type_F.:Interest_Rate_flag.1 + 
+    Monthly_Income_grp1:M_Var1_F.10 )
+
+lr.model<-glm(fm_fwd, data=train3,
+               family = binomial(link = "logit"))
+summary(lr.model)
+```
+
+####Predict on test dataset
+```{r echo=FALSE, warning=FALSE, message=FALSE, include=FALSE,results='hide'}
+test3$predlink<-round(predict(lr.model,newdata=test3,type='link'))
+summary(exp(train3$predlink))
+
+#Check vif value to examine multicollinearity
+vif(lm(model6, data=train3))
+```
+
+Accuracy=ln($\frac{TP+TN}{P+N}$)
+
+####Change cutoff value
+Use ROC curve to find an appropriate balance between sensitivity and specificity
+
+```{r message=FALSE,warning=FALSE}
+#load transformed cutoffset.t
+load(paste0(dataloc,"cutoffset.t"))
+
+#Plot ROC curve
+plot(roc(cutoffset.t$Approved, exp(cutoffset.t$predlink), direction="<"),
+     col="blue", lwd=3, main="ROC curve - logistic regression")
+lrroc<-roc(cutoffset.t$Approved, exp(cutoffset.t$predlink), direction="<")
+coords(lrroc,x='best',best.method='closest.topleft')
+```
+
+```{r message=FALSE,warning=FALSE}
+#Calculate prediction with optimal cutoff value
+test3$pred<-ifelse(exp(test3$predlink)>0.045,1,0)
+
+#Calculate AUC
+p<-ifelse(exp(test3$predlink)>0.045,1,0)
+pr <- prediction(p, test3$Approved)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+
+#Plot Gains Chart
+GAINS.CHART(test3$Approved,exp(test3$predlink),n.rank=10)
+
+#Confusion matrix
+confusionMatrix(test3$pred,test3$Approved)
+```
+
+####Residual Analysis
+```{r}
+Residual(train3$Approved,train3$pred,train3$Existing_EMI,Weight=train3$one,NBins=50)
+Residual(train3$Approved,train3$pred,train3$Loan_Amount,Weight=train3$one,NBins=50)
+Residual(train3$Approved,train3$pred,train3$Interest_Rate,Weight=train3$one,NBins=30)
+```
+
+####Lorenz Curve, Train vs Test
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+test3$one=1
+##Lorenz Curve
+TrainCheck<- OrderedCDF(Score = train3$pred, Loss = train3$Approved, Weight = train3$one, NBins = 1000)
+TestCheck<- OrderedCDF(Score = test3$pred, Loss = test3$Approved, Weight = test3$one, NBins = 1000)
+
+TestWeight <- TestCheck$WeightPts
+TestLoss <- TestCheck$LossPts
+TrainWeight <- TrainCheck$WeightPts
+TrainLoss <- TrainCheck$LossPts
+
+ModelComparisonData <- data.frame(TestWeight, TestLoss, TrainWeight, TrainLoss)
+```
+
+```{r warning=FALSE, message=FALSE}
+ModelComparisonData %>% ggvis(~ValidationWeight, ~ValidationLoss) %>% layer_paths(stroke := "blue") %>% 
+  layer_paths(data = ModelComparisonData, x = ~ValidationWeight, y = ~ValidationWeight, stroke := "black") %>%
+  layer_paths(data = ModelComparisonData, x = ~TrainWeight, y = ~TrainLoss, stroke := "red")
+```
+
+### 5.Smote GBM
+```{r warning=FALSE, message=FALSE}
+###smote gbm#################################
+#Load transformed dataset for GBM model
+load(paste0(dataloc,'train.t.RData'))
+load(paste0(dataloc,'test.t.RData'))
+
+###tune gbm#################################
+train.t$Approved<-as.factor(ifelse(train.t$Approved==1,'Approved','Rejected'))
+test.t$Approved<-as.factor(ifelse(test.t$Approved==1,'Approved','Rejected'))
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 5,
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE)
+
+
+set.seed(1234)
+
+gbmGrid <-  expand.grid(interaction.depth = c(1,2,3),
+                        n.trees = (1:20)*50, 
+                        shrinkage = c(0.1,0.05),
+                        n.minobsinnode = 50) 
+
+ctrl$sampling <- "smote"
+
+gbm_fit <- train(Approved~.,
+                 data = train.t,
+                 method = "gbm",
+                 bag.fraction = 0.5,
+                 verbose = FALSE,
+                 metric = "ROC",
+                 trControl = ctrl,
+                 tuneGrid =gbmGrid
+                 # ,na.action=na.exclude
+)
+
+#find best iteration
+plot(gbm_fit)
+summary(gbm_fit)
+save(gbm_fit,file=paste0(output,'gbm_fit.RData'))
+gbm_fit$bestTune
+```
+
+```{r warning=FALSE, message=FALSE}
+#run gbm with tuned parameters##############
+set.seed(12345)
+gbm_tuned <- gbm(Approved~.,
+                 distribution = "bernoulli",
+                 data = train.t,
+                 n.trees = 500,# convergence issue, just need enough to converge
+                 shrinkage = 0.05,  # convergence issue, lower is better but takes longer.
+                 interaction.depth = 3, # effects tree complexity
+                 n.minobsinnode = 200, # tree argument 1082/bag.fraction/train.fraction
+                 bag.fraction = 0.5, #optimization argument
+                 train.fraction = 1.0,
+                 cv.folds=5, 
+                 keep.data = TRUE,
+                 verbose = TRUE, #"CV",
+                 class.stratify.cv=NULL
+)
+best.iter <- gbm.perf(gbm_tuned, method="cv")
+train.predlink <- predict.gbm(gbm_tuned, n.trees = best.iter,newdata = train.t,type='link')
+#best.iter=204 
+save(gbm_tuned, file=paste0(output,'gbm_tuned.RData'))
+
+#Calculate prediction on test set
+gbm.predlink <- predict.gbm(gbm_tuned, n.trees = best.iter,newdata = test.t,type='link')
+```
+
+Plot ROC curve
+```{r warning=FALSE, message=FALSE}
+#Use ROC curve to find an appropriate balance between sensitivity and specificity on cutoffset
+lrroc<-roc(cutoffset.t$Approved, exp(cutoffset.t$predlink), direction="<")
+coords(lrroc,x='best',best.method='closest.topleft')
+plot(roc(cutoffset.t$Approved, exp(cutoffset.t$predlink), direction="<"),
+     col="blue", lwd=3, main="ROC curve - Smote GBM")
+
+#Calculate prediction on testset with optimal cutoff value
+gbm.pred=as.factor(ifelse(exp(gbm.predlink)>0.03,'Approved','Rejected')) #0.03
+```
+
+Plot Gains Chart and Confusion Matrix
+```{r warning=FALSE, message=FALSE}
+gbm.predict<-cbind((gbm.predlink),gbm.pred)
+colnames(gbm.predict)<-c('gbm.predlink','gbm.pred')
+save(gbm.predict,file=paste0(dataloc,'gbm.pred.RData'))
+
+#Plot Gains Chart
+test.t$Approved<-as.numeric(test.t$Approved)
+GAINS.CHART(test.t$Approved,exp(gbm.pred),n.rank=8)
+
+test.pred<-as.factor(gbm.pred)
+test.t$Approved<-as.factor(test.t$Approved)
+
+confusionMatrix(gbm.pred,test.t$Approved)
+
+save(gbm_tuned,file=paste0(output,"smote_fit.RData"))
+```
+
+### 6.Model Comparison on Holdout dataset
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#original data model comparison#########################
+#Predictions on Holdoutset was pre-calculated using above models and saved in output
+load(paste0(output,'gbm.pred.RData'))
+load(paste0(output,'glm.pred.RData'))
+
+data<-as.data.frame(gbm.predict%>%mutate(glm.predlink=glm.predict$glm.predlink,glm.pred=glm.predict$glm.pred))
+
+#Plot ROC curves
+plot(roc(test.t$Approved, data$gbm.predlink, direction="<"),
+     col="grey", lwd=2, main="ROC curve",xlim=c(1,0))
+lines(roc(test.t$Approved, data$glm.predlink, direction="<"),
+      col="blue", lwd=2, main="ROC curve")
+legend("bottomright",legend=c("gbm",'glm'),
+       col=c("red","blue"), lty=1:2,cex=0.8)
+
+```
